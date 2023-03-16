@@ -4,14 +4,20 @@
 #![no_std]
 #![allow(non_snake_case)]
 
-use panic_halt as _;
+use panic_rtt_target as _;
+use rtic::app;
+use rtt_target::{rprintln, rtt_init_print};
+use stm32f1xx_hal::gpio::PinState;
+use stm32f1xx_hal::gpio::{gpioc::PC13, Output, PushPull};
+use stm32f1xx_hal::usb::{Peripheral, UsbBus, UsbBusType};
+use stm32f1xx_hal::prelude::*;
+use systick_monotonic::{fugit::Duration, Systick};
+use cortex_m::asm::delay;
+use usb_device::prelude::*;
 
-#[rtic::app(device = stm32f1xx_hal::pac)]
+#[rtic::app(device = stm32f1xx_hal::pac, peripherals = true, dispatchers = [SPI1])]
 mod app {
-    use cortex_m::asm::delay;
-    use stm32f1xx_hal::prelude::*;
-    use stm32f1xx_hal::usb::{Peripheral, UsbBus, UsbBusType};
-    use usb_device::prelude::*;
+    use super::*;
 
     #[shared]
     struct Shared {
@@ -20,7 +26,14 @@ mod app {
     }
 
     #[local]
-    struct Local {}
+    struct Local {
+        led: PC13<Output<PushPull>>,
+        state: bool,
+    }
+
+    #[monotonic(binds = SysTick, default = true)]
+    type MonoTimer = Systick<1000>;
+
 
     #[init]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
@@ -28,6 +41,10 @@ mod app {
 
         let mut flash = cx.device.FLASH.constrain();
         let rcc = cx.device.RCC.constrain();
+
+        rtt_init_print!();
+        rprintln!("init");
+
 
         let clocks = rcc
             .cfgr
@@ -39,6 +56,16 @@ mod app {
         assert!(clocks.usbclk_valid());
 
         let mut gpioa = cx.device.GPIOA.split();
+        let mut gpiob = cx.device.GPIOB.split();
+
+        let mut gpioc = cx.device.GPIOC.split();
+        let led = gpioc
+            .pc13
+            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::Low);
+
+
+        let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
+        let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob.crl);
 
         // BluePill board has a pull-up resistor on the D+ line.
         // Pull the D+ pin down to send a RESET condition to the USB bus.
@@ -73,7 +100,30 @@ mod app {
         .device_class(usbd_serial::USB_CLASS_CDC)
         .build();
 
-        (Shared { usb_dev, serial }, Local {}, init::Monotonics())
+        let mono = Systick::new(cx.core.SYST, 36_000_000);
+
+
+        blink::spawn_after(Duration::<u64, 1, 1000>::from_ticks(1000)).unwrap();
+
+        (Shared { usb_dev, serial }, Local {led, state: false}, init::Monotonics(mono))
+    }
+
+    // #[task()]
+    // fn idle() {
+
+    // }
+
+    #[task(local = [led, state])]
+    fn blink(cx: blink::Context) {
+        rprintln!("blink");
+        if *cx.local.state {
+            cx.local.led.set_high();
+            *cx.local.state = false;
+        } else {
+            cx.local.led.set_low();
+            *cx.local.state = true;
+        }
+        blink::spawn_after(Duration::<u64, 1, 1000>::from_ticks(1000)).unwrap();
     }
 
     #[task(binds = USB_HP_CAN_TX, shared = [usb_dev, serial])]
