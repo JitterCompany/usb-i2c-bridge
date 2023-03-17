@@ -4,26 +4,29 @@
 #![no_std]
 #![allow(non_snake_case)]
 
-use rtic;
 use cortex_m::asm::delay;
 use heapless::spsc;
 use heapless::spsc::{Producer, Queue};
 use heapless::Vec;
 use panic_rtt_target as _;
+use rtic;
 use rtt_target::{rprintln, rtt_init_print};
 use stm32f1xx_hal::gpio::PinState;
-use stm32f1xx_hal::gpio::{gpioc::PC13, OpenDrain, Output, PushPull, Alternate, Pin};
+use stm32f1xx_hal::gpio::{gpioc::PC13, Alternate, OpenDrain, Output, Pin, PushPull};
 use stm32f1xx_hal::i2c::{BlockingI2c, DutyCycle, Mode};
+use stm32f1xx_hal::pac::I2C1;
 use stm32f1xx_hal::prelude::*;
 use stm32f1xx_hal::usb::{Peripheral, UsbBus, UsbBusType};
+use stm32f1xx_hal::{device::TIM1, timer::Counter};
+use systick_monotonic::fugit::Instant;
 use systick_monotonic::{fugit::Duration, Systick};
 use usb_device::prelude::*;
-use stm32f1xx_hal::pac::I2C1;
 
 const SENSOR_BOOTLOADER_I2C_ADDRESS: u8 = 0x42;
 
 #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true, dispatchers = [SPI1])]
 mod app {
+
     use super::*;
 
     #[shared]
@@ -31,6 +34,8 @@ mod app {
         usb_dev: UsbDevice<'static, UsbBusType>,
         serial: usbd_serial::SerialPort<'static, UsbBusType>,
         i2c_buffer: Vec<u8, 512>,
+        timer: Counter<TIM1, 1000>,
+        last_read: Option<Instant<u32, 1, 1000>>,
     }
 
     #[local]
@@ -136,6 +141,9 @@ mod app {
 
         let mono = Systick::new(cx.core.SYST, 36_000_000);
 
+        let mut timer = cx.device.TIM1.counter_ms(&clocks);
+        timer.start(10.secs()).unwrap();
+
         let (prod, cons) = cx.local.queue.split();
         blink::spawn_after(Duration::<u64, 1, 1000>::from_ticks(1000)).unwrap();
 
@@ -144,6 +152,8 @@ mod app {
                 usb_dev,
                 serial,
                 i2c_buffer: Vec::new(),
+                timer,
+                last_read: None,
             },
             Local {
                 led,
@@ -156,45 +166,72 @@ mod app {
         )
     }
 
-    #[idle(local = [cons, i2c], shared = [i2c_buffer, serial])]
+    #[idle(local = [cons, i2c], shared = [i2c_buffer, serial, timer, last_read])]
     fn idle(cx: idle::Context) -> ! {
-        let queue = cx.local.cons;
-        let mut buffer = cx.shared.i2c_buffer;
 
-        let mut i2c = cx.local.i2c;
+        let queue = cx.local.cons;
+        let i2c = cx.local.i2c;
+
+        let mut buffer = cx.shared.i2c_buffer;
         let mut serial = cx.shared.serial;
+        let mut timer = cx.shared.timer;
+        let mut last_read = cx.shared.last_read;
 
         loop {
-            buffer.lock(|b| {
-                if b.len() > 0 {
-                    rprintln!("vec {:?}", b.as_slice());
-                    i2c.write(SENSOR_BOOTLOADER_I2C_ADDRESS, b.as_slice());
-                    b.clear();
-                    let mut read_buff = [0u8; 1];
+            let do_i2c_stuff = (&mut timer, &mut last_read).lock(|timer, last_read| {
+                let timer_expired = if let Some(last_read) = last_read {
 
-                    match i2c.read(SENSOR_BOOTLOADER_I2C_ADDRESS, &mut read_buff) {
-                        Ok(_) => {
-                            if read_buff[0] < 255 {
-                                rprintln!("send back: {:?}", read_buff[0] as char);
-                                serial.lock(|ser| {
-                                    ser.write(&read_buff).ok();
-                                })
-                            }
+                    let duration = timer.now().checked_duration_since(*last_read);
 
-                        },
-                        Err(err) => {
-                            rprintln!("Error i2c read {:?}", err);
-                        },
+                    if let Some(time) = duration {
+                        // rprintln!("duration {:?} ms", time.to_millis());
+                        time.to_millis() > 10
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                };
+
+                if timer_expired {
+                    last_read.take();
                 }
+                timer_expired
             });
 
+            if do_i2c_stuff {
+                buffer.lock(|b| {
+                    rprintln!("send i2c {:?}", b.as_slice());
+                    i2c.write(SENSOR_BOOTLOADER_I2C_ADDRESS, b.as_slice());
+                    b.clear();
 
-            if queue.len() > 0 {
-                while let Some(byte) = queue.dequeue() {
-                    rprintln!("CMD {:?}", byte as char);
-                }
+                    let mut read_buff = [0u8; 8];
+                    match i2c.read(SENSOR_BOOTLOADER_I2C_ADDRESS, &mut read_buff) {
+                        Ok(_) => {
+                            for byte in read_buff {
+                                if byte < 255 {
+                                    rprintln!("send back: {:?}", byte);
+
+                                    serial.lock(|ser| {
+                                        ser.write(&[byte]).ok();
+                                    })
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            rprintln!("Error i2c read {:?}", err);
+                        }
+                    }
+
+                });
             }
+
+
+            // if queue.len() > 0 {
+            //     while let Some(byte) = queue.dequeue() {
+            //         rprintln!("CMD {:?}", byte as char);
+            //     }
+            // }
 
             core::hint::spin_loop();
         }
@@ -223,17 +260,22 @@ mod app {
         });
     }
 
-    #[task(binds = USB_LP_CAN_RX0, shared = [usb_dev, serial, i2c_buffer], local = [prod])]
+    #[task(binds = USB_LP_CAN_RX0, shared = [usb_dev, serial, i2c_buffer, timer, last_read], local = [prod])]
     fn usb_rx0(cx: usb_rx0::Context) {
         let mut usb_dev = cx.shared.usb_dev;
         let mut serial = cx.shared.serial;
+        let timer = cx.shared.timer;
+        let last_read = cx.shared.last_read;
 
         let producer = cx.local.prod;
         let mut buffer = cx.shared.i2c_buffer;
 
         (&mut usb_dev, &mut serial, &mut buffer).lock(|usb_dev, serial, buffer| {
             if super::usb_poll(usb_dev, serial) {
-                super::usb_read(usb_dev, serial, producer, buffer);
+                let bytes_read = super::usb_read(usb_dev, serial, producer, buffer);
+                if bytes_read == true {
+                    (timer, last_read).lock(|timer, last_read| last_read.replace(timer.now()));
+                }
             }
         });
     }
@@ -251,27 +293,22 @@ fn usb_read<B: usb_device::bus::UsbBus>(
     serial: &mut usbd_serial::SerialPort<'static, B>,
     queue: &mut Producer<u8, 512>,
     buffer: &mut Vec<u8, 512>,
-) {
+) -> bool {
     if !usb_dev.poll(&mut [serial]) {
-        return;
+        return false;
     }
 
     let mut buf = [0u8; 64];
 
     match serial.read(&mut buf) {
         Ok(count) if count > 0 => {
-            buffer.extend_from_slice(&buf[0..count]);
-            // Echo back in upper case
-            for c in buf[0..count].iter_mut() {
-                queue.enqueue(*c);
-
-                // if 0x61 <= *c && *c <= 0x7a {
-                //     *c &= !0x20;
-                // }
-            }
-
-            // serial.write(&buf[0..count]).ok();
+            rprintln!("Read {} bytes: {:?}", count, &buf[0..count]);
+            buffer.extend_from_slice(&buf[0..count]).ok();
+            // for c in buf[0..count].iter_mut() {
+            //     queue.enqueue(*c);
+            // }
+            true
         }
-        _ => {}
+        _ => false,
     }
 }

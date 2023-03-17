@@ -4,9 +4,16 @@
 [default.general]
 chip = "STM32F103RB"
 
+[default.flashing]
+# Whether or not the target should be flashed.
+enabled = false
+
 [default.rtt]
 enabled = true
 show_timestamps = true
+log_enabled = true
+# Where to save rtt history buffer relative to manifest path.
+log_path = "./logs"
 
 [default.gdb]
 # Whether or not a GDB server should be opened after flashing.
