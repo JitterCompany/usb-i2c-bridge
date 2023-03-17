@@ -6,7 +6,7 @@ chip = "STM32F103RB"
 
 [default.flashing]
 # Whether or not the target should be flashed.
-enabled = false
+enabled = true
 
 [default.rtt]
 enabled = true

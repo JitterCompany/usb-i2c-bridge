@@ -1,12 +1,9 @@
-//! CDC-ACM serial port example using cortex-m-rtic.
+//! CDC-ACM serial port example using cortex-m-rtic combined with i2c
 //! Target board: Blue Pill
 #![no_main]
 #![no_std]
-#![allow(non_snake_case)]
 
 use cortex_m::asm::delay;
-use heapless::spsc;
-use heapless::spsc::{Producer, Queue};
 use heapless::Vec;
 use panic_rtt_target as _;
 use rtic;
@@ -41,10 +38,6 @@ mod app {
     #[local]
     struct Local {
         led: PC13<Output<PushPull>>,
-        state: bool,
-
-        prod: spsc::Producer<'static, u8, 512>,
-        cons: spsc::Consumer<'static, u8, 512>,
 
         i2c: BlockingI2c<
             I2C1,
@@ -58,9 +51,7 @@ mod app {
     #[monotonic(binds = SysTick, default = true)]
     type MonoTimer = Systick<1000>;
 
-    #[init(local = [
-        queue: Queue<u8, 512> = Queue::new()
-    ])]
+    #[init()]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         static mut USB_BUS: Option<usb_device::bus::UsbBusAllocator<UsbBusType>> = None;
 
@@ -144,7 +135,6 @@ mod app {
         let mut timer = cx.device.TIM1.counter_ms(&clocks);
         timer.start(10.secs()).unwrap();
 
-        let (prod, cons) = cx.local.queue.split();
         blink::spawn_after(Duration::<u64, 1, 1000>::from_ticks(1000)).unwrap();
 
         (
@@ -155,21 +145,13 @@ mod app {
                 timer,
                 last_read: None,
             },
-            Local {
-                led,
-                state: false,
-                prod,
-                cons,
-                i2c,
-            },
+            Local { led, i2c },
             init::Monotonics(mono),
         )
     }
 
-    #[idle(local = [cons, i2c], shared = [i2c_buffer, serial, timer, last_read])]
+    #[idle(local = [i2c], shared = [i2c_buffer, serial, timer, last_read])]
     fn idle(cx: idle::Context) -> ! {
-
-        let queue = cx.local.cons;
         let i2c = cx.local.i2c;
 
         let mut buffer = cx.shared.i2c_buffer;
@@ -180,12 +162,12 @@ mod app {
         loop {
             let do_i2c_stuff = (&mut timer, &mut last_read).lock(|timer, last_read| {
                 let timer_expired = if let Some(last_read) = last_read {
-
                     let duration = timer.now().checked_duration_since(*last_read);
 
                     if let Some(time) = duration {
-                        // rprintln!("duration {:?} ms", time.to_millis());
-                        time.to_millis() > 10
+                        // we wait until we didn't get any uart message for 2 ms until
+                        // we bundle it and send it over i2c
+                        time.to_millis() > 2
                     } else {
                         false
                     }
@@ -200,17 +182,22 @@ mod app {
             });
 
             if do_i2c_stuff {
-                buffer.lock(|b| {
-                    rprintln!("send i2c {:?}", b.as_slice());
-                    i2c.write(SENSOR_BOOTLOADER_I2C_ADDRESS, b.as_slice());
-                    b.clear();
+                buffer.lock(|buffer| {
+                    rprintln!("send i2c {:?}", buffer.as_slice());
+                    match i2c.write(SENSOR_BOOTLOADER_I2C_ADDRESS, buffer.as_slice()) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            rprintln!("Error writing i2c: {:?}", err);
+                        }
+                    }
+                    buffer.clear();
 
                     let mut read_buff = [0u8; 8];
                     match i2c.read(SENSOR_BOOTLOADER_I2C_ADDRESS, &mut read_buff) {
                         Ok(_) => {
                             for byte in read_buff {
                                 if byte < 255 {
-                                    rprintln!("send back: {:?}", byte);
+                                    rprintln!("read i2c: {:?}", byte);
 
                                     serial.lock(|ser| {
                                         ser.write(&[byte]).ok();
@@ -222,32 +209,17 @@ mod app {
                             rprintln!("Error i2c read {:?}", err);
                         }
                     }
-
                 });
+                blink::spawn().unwrap();
             }
-
-
-            // if queue.len() > 0 {
-            //     while let Some(byte) = queue.dequeue() {
-            //         rprintln!("CMD {:?}", byte as char);
-            //     }
-            // }
 
             core::hint::spin_loop();
         }
     }
 
-    #[task(local = [led, state])]
+    #[task(local = [led])]
     fn blink(cx: blink::Context) {
-        // rprintln!("blink");
-        if *cx.local.state {
-            cx.local.led.set_high();
-            *cx.local.state = false;
-        } else {
-            cx.local.led.set_low();
-            *cx.local.state = true;
-        }
-        blink::spawn_after(Duration::<u64, 1, 1000>::from_ticks(1000)).unwrap();
+        cx.local.led.toggle();
     }
 
     #[task(binds = USB_HP_CAN_TX, shared = [usb_dev, serial])]
@@ -260,19 +232,18 @@ mod app {
         });
     }
 
-    #[task(binds = USB_LP_CAN_RX0, shared = [usb_dev, serial, i2c_buffer, timer, last_read], local = [prod])]
+    #[task(binds = USB_LP_CAN_RX0, shared = [usb_dev, serial, i2c_buffer, timer, last_read])]
     fn usb_rx0(cx: usb_rx0::Context) {
         let mut usb_dev = cx.shared.usb_dev;
         let mut serial = cx.shared.serial;
         let timer = cx.shared.timer;
         let last_read = cx.shared.last_read;
 
-        let producer = cx.local.prod;
         let mut buffer = cx.shared.i2c_buffer;
 
         (&mut usb_dev, &mut serial, &mut buffer).lock(|usb_dev, serial, buffer| {
             if super::usb_poll(usb_dev, serial) {
-                let bytes_read = super::usb_read(usb_dev, serial, producer, buffer);
+                let bytes_read = super::usb_read(serial, buffer);
                 if bytes_read == true {
                     (timer, last_read).lock(|timer, last_read| last_read.replace(timer.now()));
                 }
@@ -289,24 +260,14 @@ fn usb_poll<B: usb_device::bus::UsbBus>(
 }
 
 fn usb_read<B: usb_device::bus::UsbBus>(
-    usb_dev: &mut usb_device::prelude::UsbDevice<'static, B>,
     serial: &mut usbd_serial::SerialPort<'static, B>,
-    queue: &mut Producer<u8, 512>,
     buffer: &mut Vec<u8, 512>,
 ) -> bool {
-    if !usb_dev.poll(&mut [serial]) {
-        return false;
-    }
-
     let mut buf = [0u8; 64];
 
     match serial.read(&mut buf) {
         Ok(count) if count > 0 => {
-            rprintln!("Read {} bytes: {:?}", count, &buf[0..count]);
             buffer.extend_from_slice(&buf[0..count]).ok();
-            // for c in buf[0..count].iter_mut() {
-            //     queue.enqueue(*c);
-            // }
             true
         }
         _ => false,
