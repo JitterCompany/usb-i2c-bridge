@@ -7,7 +7,7 @@ use cortex_m::asm::delay;
 use heapless::Vec;
 use panic_rtt_target as _;
 use rtic;
-use rtt_target::{rprintln, rtt_init_print};
+use rtt_target::{rprintln, rtt_init, set_print_channel, UpChannel};
 use stm32f1xx_hal::gpio::PinState;
 use stm32f1xx_hal::gpio::{gpioc::PC13, Alternate, OpenDrain, Output, Pin, PushPull};
 use stm32f1xx_hal::i2c::{BlockingI2c, DutyCycle, Mode};
@@ -51,6 +51,28 @@ mod app {
     #[monotonic(binds = SysTick, default = true)]
     type MonoTimer = Systick<1000>;
 
+    fn init_rtt() {
+        let channels = rtt_init! {
+            up: {
+                0: {
+                    size: 4096
+                    mode: NoBlockSkip
+                    name: "Print Output"
+                }
+            }
+            down: {
+                0: {
+                    size: 80
+                    mode: NoBlockSkip
+                    name: "Command input"
+                }
+            }
+        };
+
+        let output = channels.up.0;
+        set_print_channel(output);
+    }
+
     #[init()]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         static mut USB_BUS: Option<usb_device::bus::UsbBusAllocator<UsbBusType>> = None;
@@ -58,7 +80,7 @@ mod app {
         let mut flash = cx.device.FLASH.constrain();
         let rcc = cx.device.RCC.constrain();
 
-        rtt_init_print!();
+        init_rtt();
         rprintln!("init");
 
         let clocks = rcc
@@ -183,7 +205,7 @@ mod app {
 
             if do_i2c_stuff {
                 buffer.lock(|buffer| {
-                    rprintln!("send i2c {:?}", buffer.as_slice());
+                    rprintln!("send i2c {:X?}", buffer.as_slice());
                     match i2c.write(SENSOR_BOOTLOADER_I2C_ADDRESS, buffer.as_slice()) {
                         Ok(_) => {}
                         Err(err) => {
@@ -197,7 +219,7 @@ mod app {
                         Ok(_) => {
                             for byte in read_buff {
                                 if byte < 255 {
-                                    rprintln!("read i2c: {:?}", byte);
+                                    rprintln!("read i2c: {:X?}", byte);
 
                                     serial.lock(|ser| {
                                         ser.write(&[byte]).ok();
