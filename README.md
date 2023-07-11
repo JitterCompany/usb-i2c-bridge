@@ -4,6 +4,17 @@ This is project converts usb serial to i2c. It is specifically built for use wit
 
 - stm32f103.
 
+Flash the tool with e.g. STLINK as a release build. This is important because in debug it is not fast enough.
+
+```bash
+cargo run --release
+
+# or
+
+cargo embed --release
+```
+
+
 ## Usage
 
 [avrdude] ---*usb serial*--- [**this converter**] ---*i2c*--- [atxmega with xboot bootloader]
