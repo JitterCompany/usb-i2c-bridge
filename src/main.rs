@@ -214,7 +214,8 @@ mod app {
                     }
                     buffer.clear();
 
-                    let mut read_buff = [0u8; 8];
+                    let mut read_buff = [0u8; 256];
+                    // We'd like to read until NACK. But the HAL does not really expose that.
                     match i2c.read(SENSOR_BOOTLOADER_I2C_ADDRESS, &mut read_buff) {
                         Ok(_) => {
                             for byte in read_buff {
